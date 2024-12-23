@@ -1,6 +1,9 @@
 import numpy as np
-import D2D_generator_1 as D2D
+import D2D_generator as D2D
 import utils
+import Graph_builder as Gbld
+import torch
+from torch_geometric.data import DataLoader
 
 # 真实版信道生成
 class init_parameters():
@@ -25,22 +28,43 @@ class init_parameters():
                                                                 self.shortest_directLink_length,
                                                                 self.longest_directLink_length)
 
+class AirMPNN(torch.nn.Module):
+    def __init__(self):
+        super(AirMPNN, self).__init__()
+
+    def foward(self, data):
+        pass
+
+class LocalMPNN(torch.nn.Module):
+    def __init__(self):
+        super(AirMPNN, self).__init__()
+
+    def foward(self, data):
+        pass
+
+
 D2DNum_K = 40
 train_layouts = 2  # 模拟拓扑结构变化
 train_timesteps = 3
-config = init_parameters()
+train_config = init_parameters()
 
-print('Data generation')
-# Data generation
-# Train data
-layouts, train_dists = D2D.layouts_generator(config, train_layouts)  # 创建训练集个数的tx、rx分布以及所有链路的距离信息（相当于生成训练集个数的地图）
-# train_path_losses = D2D.compute_path_losses(config,train_dists)  # 计算所有链路的路径损耗的绝对值，这里的loss是path_loss，不是loss_function
-train_path_losses = D2D.compute_path_losses_easily(config,train_dists)  # 使用WCNC的公式简易计算
-train_channel_losses = D2D.add_fast_fading_sequence(train_timesteps, train_path_losses)  # 在每一个帧加入快衰落,将frame_num设为1
+# Train data generation
+print('Train data generation')
+train_channel_real = D2D.train_channel_generator_1(train_config, train_layouts, train_timesteps) # 真实信道
+train_channel_simplified = D2D.train_channel_generator_2(train_layouts, train_timesteps, D2DNum_K) # 简易信道（仿真使用）
+train_directlink_losses = utils.get_directlink_losses(train_channel_simplified)
 
+# Graph data processing
+print('Graph data processing')
+global_graph_fully_connected = Gbld.graph_builder_fully_connected()  # 构建全局图拓扑结构(全连接型)
+global_graph_partially_connected = Gbld.graph_builder_partially_connected()  # 构建全局图拓扑结构（部分连接，即干扰链路小的边忽略不计）
+local_graph_list = Gbld.collect_subgraph()  # 挑选并构建本地的子图（一跳或多跳）,并构成一个list
 
-# 简易版信道生成
-# 来自GNN4Com中的D2D代码
-c = 1/np.sqrt(2)
-train_channel_losses_2 = np.abs(c * np.random.randn(train_layouts, train_timesteps, D2DNum_K, D2DNum_K) + c * 1j * np.random.randn(train_layouts, train_timesteps, D2DNum_K, D2DNum_K))
-print('end')
+# Local training
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model_basic = LocalMPNN().to(device)  # 基础本地模型
+model_over_the_air = AirMPNN().to(device)  # 后续可以加入over the air模块
+
+optimizer = torch.optim.Adam(model_basic.parameters(), lr=0.002)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
+train_loader = DataLoader(local_graph_list, batch_size=50, shuffle=True, num_workers=0)

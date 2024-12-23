@@ -104,3 +104,20 @@ def add_fast_fading_sequence(timesteps, train_path_losses):  # timesteps为帧�
         channel_losses_sequence[i,:,:,:] = np.resize(layout_channel_losses_sequence,(timesteps,n[1],n[2]))
     return channel_losses_sequence
 
+# 真实版信道生成
+# 来自GNN_over_the_air中的代码
+def train_channel_generator_1(config, layouts, timesteps):
+    layouts, train_dists = layouts_generator(config, layouts)  # 创建训练集个数的tx、rx分布以及所有链路的距离信息（相当于生成训练集个数的地图）
+    # train_path_losses = D2D.compute_path_losses(config,train_dists)  # 计算所有链路的路径损耗的绝对值，这里的loss是path_loss，不是loss_function
+    train_path_losses = compute_path_losses_easily(config, train_dists)  # 使用WCNC的公式简易计算
+    train_channel_losses_1 = add_fast_fading_sequence(timesteps, train_path_losses)
+    return train_channel_losses_1
+
+# 简易版信道生成
+# 来自GNN4Com中的D2D代码
+def train_channel_generator_2(layouts, timesteps, D2DNum):
+    c = 1 / np.sqrt(2)
+    train_channel_losses_2 = np.abs(
+        c * np.random.randn(layouts, timesteps, D2DNum, D2DNum) + c * 1j * np.random.randn(
+            layouts, timesteps, D2DNum, D2DNum))
+    return train_channel_losses_2
