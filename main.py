@@ -45,14 +45,17 @@ class LocalMPNN(torch.nn.Module):
 
 D2DNum_K = 40
 train_layouts = 2  # 模拟拓扑结构变化
-train_timesteps = 3
+train_frames = 3
 train_config = init_parameters()
 
 # Train data generation
 print('Train data generation')
-train_channel_real = D2D.train_channel_generator_1(train_config, train_layouts, train_timesteps) # 真实信道
-train_channel_simplified = D2D.train_channel_generator_2(train_layouts, train_timesteps, D2DNum_K) # 简易信道（仿真使用）
-train_directlink_losses = utils.get_directlink_losses(train_channel_simplified)
+train_losses_real = D2D.train_channel_loss_generator_1(train_config, train_layouts, train_frames) # 真实信道
+train_losses_simplified = D2D.train_channel_loss_generator_2(train_layouts, train_frames, D2DNum_K) # 简易信道（仿真使用）
+train_directlink_losses = utils.get_directlink_losses(train_losses_simplified)
+
+# Data standardization/normalization
+std_train_losses_simp = utils.standardize_train_data()
 
 # Graph data processing
 print('Graph data processing')

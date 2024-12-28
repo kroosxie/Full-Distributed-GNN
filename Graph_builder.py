@@ -1,8 +1,10 @@
 import numpy as np
+import torch
+from torch_geometric.data import Data
 
 
-def fully_connected_graph_builder(loss, norm_loss, K):
-    x1 = np.expand_dims(norm_loss, axis=1)
+def fully_connected_graph_builder(loss, std_H, K, graph_embedding_size):
+    x1 = np.expand_dims(np.diag(std_H), axis=1)
     x2 = np.zeros((K, graph_embedding_size))
     x = np.concatenate((x1, x2), axis=1)
     x = torch.tensor(x, dtype=torch.float)
@@ -26,14 +28,16 @@ def fully_connected_graph_builder(loss, norm_loss, K):
     data = Data(x=x, edge_index=edge_index.contiguous(), edge_attr=edge_attr, y=y)
     return data
 
-def build_graph():
-    return
+def graph_builder_partially_connected():
+    pass
 
-
-def proc_data(HH, norm_HH, K):
-    n = HH.shape[0]  # layouts
+def proc_data_centralized(HH_real, H_std, K, init_emb_size):
+    n = HH_real.shape[0]  # 即 layouts,每个layouts构建一张图
     data_list = []
     for i in range(n):
-        data = build_graph(HH[i, :, :], norm_HH[i, :], K)
+        data = fully_connected_graph_builder(HH_real[i,:,:], H_std[i,:,:], K, init_emb_size)
         data_list.append(data)
     return data_list
+
+
+

@@ -1,5 +1,26 @@
 import numpy as np
 
+def add_fast_fading_sequence(timesteps, train_path_losses):  # timesteps为时间步长，即帧的数目
+    n = np.shape(train_path_losses)
+    n_links = np.multiply(n[1],n[2])
+    channel_losses_sequence = np.zeros((n[0],timesteps,n[1],n[2]))
+    for i in range(n[0]):
+        r = np.random.rand()
+        alpha = np.resize(train_path_losses[i,:,:],n_links)
+        noise_var = np.multiply(alpha,1-np.power(r,2))
+        # channel coefficient matrix
+        sims_real = np.zeros((timesteps,n_links))
+        sims_imag = np.zeros((timesteps,n_links))
+    # generate the channel coefficients for consecutive frames
+    # 生成连续帧的信道系数
+        sims_real[0,:] = np.random.normal(loc = 0, scale = np.sqrt(alpha))
+        sims_imag[0,:] = np.random.normal(loc = 0, scale = np.sqrt(alpha))
+        for j in range(timesteps-1):
+            sims_real[j+1,:] = np.multiply(r,sims_real[j,:]) + np.random.normal(loc = 0, scale = np.sqrt(noise_var))
+            sims_imag[j+1,:] = np.multiply(r,sims_imag[j,:]) + np.random.normal(loc = 0, scale = np.sqrt(noise_var))
+        layout_channel_losses_sequence = (np.power(sims_real, 2) + np.power(sims_imag, 2))/2
+        channel_losses_sequence[i,:,:,:] = np.resize(layout_channel_losses_sequence,(timesteps,n[1],n[2]))
+    return channel_losses_sequence
 
 def layout_generator(general_para):
     N = general_para.n_links  # N是link的数目
@@ -82,42 +103,24 @@ def compute_path_losses(general_para, distances):
     pathlosses = np.power(10, (pathlosses / 10))  # convert from decibel to absolute 将dB形式转化为绝对值
     return pathlosses  # 返回所有链路的路径损耗的绝对值
 
-def add_fast_fading_sequence(timesteps, train_path_losses):  # timesteps为帧的数目
-    n = np.shape(train_path_losses)
-    n_links = np.multiply(n[1],n[2])
-    channel_losses_sequence = np.zeros((n[0],timesteps,n[1],n[2]))
-    for i in range(n[0]):
-        r = np.random.rand()
-        alpha = np.resize(train_path_losses[i,:,:],n_links)
-        noise_var = np.multiply(alpha,1-np.power(r,2))
-        # channel coefficient matrix
-        sims_real = np.zeros((timesteps,n_links))
-        sims_imag = np.zeros((timesteps,n_links))
-    # generate the channel coefficients for consecutive frames
-    # 生成连续帧的信道系数
-        sims_real[0,:] = np.random.normal(loc = 0, scale = np.sqrt(alpha))
-        sims_imag[0,:] = np.random.normal(loc = 0, scale = np.sqrt(alpha))
-        for j in range(timesteps-1):
-            sims_real[j+1,:] = np.multiply(r,sims_real[j,:]) + np.random.normal(loc = 0, scale = np.sqrt(noise_var))
-            sims_imag[j+1,:] = np.multiply(r,sims_imag[j,:]) + np.random.normal(loc = 0, scale = np.sqrt(noise_var))
-        layout_channel_losses_sequence = (np.power(sims_real, 2) + np.power(sims_imag, 2))/2
-        channel_losses_sequence[i,:,:,:] = np.resize(layout_channel_losses_sequence,(timesteps,n[1],n[2]))
-    return channel_losses_sequence
 
 # 真实版信道生成
 # 来自GNN_over_the_air中的代码
-def train_channel_generator_1(config, layouts, timesteps):
+# 分为多个layout，每个layout中节点分布固定，具有多个时隙，相邻时隙信道系数具有一定相关性
+def train_channel_loss_generator_1(config, layouts, frames):
     layouts, train_dists = layouts_generator(config, layouts)  # 创建训练集个数的tx、rx分布以及所有链路的距离信息（相当于生成训练集个数的地图）
-    # train_path_losses = D2D.compute_path_losses(config,train_dists)  # 计算所有链路的路径损耗的绝对值，这里的loss是path_loss，不是loss_function
+    # train_path_losses = compute_path_losses(config,train_dists)  # 计算所有链路的路径损耗的绝对值，这里的loss是path_loss，不是loss_function
     train_path_losses = compute_path_losses_easily(config, train_dists)  # 使用WCNC的公式简易计算
-    train_channel_losses_1 = add_fast_fading_sequence(timesteps, train_path_losses)
+    train_channel_losses_1 = add_fast_fading_sequence(frames, train_path_losses)
     return train_channel_losses_1
 
 # 简易版信道生成
 # 来自GNN4Com中的D2D代码
-def train_channel_generator_2(layouts, timesteps, D2DNum):
+# 自己又加入了frames
+def train_channel_loss_generator_2(layouts, frames, D2DNum):
     c = 1 / np.sqrt(2)
-    train_channel_losses_2 = np.abs(
-        c * np.random.randn(layouts, timesteps, D2DNum, D2DNum) + c * 1j * np.random.randn(
-            layouts, timesteps, D2DNum, D2DNum))
+    train_channel_losses = np.abs(
+        c * np.random.randn(layouts, D2DNum, D2DNum) + c * 1j * np.random.randn(
+            layouts, D2DNum, D2DNum))
+    train_channel_losses_2 = add_fast_fading_sequence(frames, train_channel_losses)
     return train_channel_losses_2
