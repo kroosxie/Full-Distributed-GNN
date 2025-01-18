@@ -53,6 +53,8 @@ def layout_generator(general_para):
                 tx_coor = layout[tx_index][0:2]  # [0:2]就是0，1，即tx的x、y坐标
                 rx_coor = layout[rx_index][2:4]  # [2：4]就是2，3，即rx的x、y坐标
                 # according to paper notation convention, Hij is from jth transmitter to ith receiver
+                # xjc：一般来说是distances[tx_index][rx_index]
+                # 这也是后面edge_index翻转的原因
                 distances[rx_index][tx_index] = np.linalg.norm(
                     tx_coor - rx_coor)  # 求矩阵或向量的范数，linalg=linear+algebra，即线性代数
         # Check whether a tx-rx link (potentially cross-link) is too close 检查是否有相距过近的干扰对

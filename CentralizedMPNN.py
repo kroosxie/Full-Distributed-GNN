@@ -35,13 +35,13 @@ def sr_loss(train_data, out_p, K):
     # 将训练时以batch训练的形状[batchsize*K，1]拆分为[batchsize, K, 1]
     power = torch.reshape(power, (-1, K, 1))  # 形状为[batchsize, K, 1]
     abs_H_2 = train_data.y
-    abs_H_2 = abs_H_2.permute(0, 2, 1)
+    abs_H_2 = abs_H_2.permute(0, 2, 1)  # 注意这步，将信道矩阵行和列翻转，对应
     rx_power = torch.mul(abs_H_2, power)  # 对应元素相乘
     mask = torch.eye(K)
     mask = mask.to(device)
     valid_rx_power = torch.sum(torch.mul(rx_power, mask), 1)  # valid:有效信号
     interference = torch.sum(torch.mul(rx_power, 1-mask), 1) + var
-    rate = rate = torch.log2(1 + torch.div(valid_rx_power, interference))
+    rate = torch.log2(1 + torch.div(valid_rx_power, interference))
     sr = torch.mean(torch.sum(rate, 1))
     loss = torch.neg(sr)
     return loss
@@ -54,8 +54,8 @@ def train():
     for data in train_loader:
         data = data.to(device)
         optimizer.zero_grad()
-        out = model(data)
-        loss = sr_loss(data, out, train_K)
+        out = model(data)  # 由于dataloader中打乱了顺序，那么输出的p是不是也是乱序？是否会带来错误？
+        loss = sr_loss(data, out, train_K)  # data是打乱的话，out也是相应打乱后的顺序
         loss.backward()
         total_loss += loss.item() * data.num_graphs  # 为什么要乘？因为在sr_rate中有mean，所以可以直接乘
         optimizer.step()
@@ -77,7 +77,7 @@ class GConv(MessagePassing):
     def update(self, aggr_out, x):
         tmp = torch.cat([x, aggr_out], dim=1)  # tmp：临时变量
         comb = self.mlp2(tmp)
-        return torch.cat([x[:, :1], comb], dim=1)
+        return torch.cat([x[:, :1], comb], dim=1)  # cat是方便匹配layers（9）和h2o（8）的输入维度
 
     def forward(self, x, edge_index, edge_attr):
         x = x.unsqueeze(-1) if x.dim() == 1 else x
@@ -139,6 +139,10 @@ norm_train_loss = utils.normalize_train_data(train_channel_losses_merged)
 # Graph data processing
 train_data_list = Gbld.proc_data_centralized(train_channel_losses_merged, norm_train_loss, train_K, graph_embedding_size)
 train_loader = DataLoader(train_data_list, batch_size=50, shuffle=True, num_workers=0)  # shuffle：乱序
+# train_loader = DataLoader(train_data_list, batch_size=50, shuffle=False, num_workers=0)  # 不打乱顺序
+# Todo：PYG的DataLoader数据打乱影不影响拓扑关系？
+# 以及打乱的是list中的元素还是展开后的所有元素？
+# 打乱的是list中元素的进行前向传播的顺序，相当于leyouts集不变，每个epoch按不同的顺序前向传播
 
 # train of CentralizedMPNN
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
