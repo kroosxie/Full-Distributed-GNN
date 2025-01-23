@@ -6,10 +6,10 @@ import torch
 from torch_geometric.data import DataLoader
 from torch_geometric.nn.conv import MessagePassing
 from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, BatchNorm1d as BN
-from torch_geometric.utils import k_hop_subgraph, to_networkx
+from torch_geometric.utils import k_hop_subgraph
 from torch_geometric.data import Data
-import networkx as nx  # 用于可视化
-import matplotlib.pyplot as plt
+
+from torchviz import make_dot
 
 # 真实版信道生成
 class init_parameters():
@@ -97,12 +97,6 @@ def MLP(channels, batch_norm=True):
         for i in range(1, len(channels))
     ])
 
-# sg:subgraph 可暂定为一阶子图
-# 注意用真实值计算，即data的y标签
-# 所以使用norm数据训练是合理的
-def local_loss(out_p_sg, x_v, edge_u):
-    pass
-
 # 每个节点上都有自身的MLP_M和MLP_U
 # 若共享参数的话，意味着每一层共享一个MLP_m和MLP_u
 class LocalModel(torch.nn.Module):
@@ -128,6 +122,7 @@ class LocalH2O(torch.nn.Module):  # 需要继承吗？
         return out_p
 
 
+# class DistributedMPNN():
 class DistributedMPNN(torch.nn.Module):  # per round
     def __init__(self, node_num):
         super(DistributedMPNN, self).__init__()
@@ -158,10 +153,6 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 flow='target_to_source',
             )
 
-            # data = to_networkx(data)
-            # nx.draw(data, with_labels=data.nodes)
-            # plt.show()
-
             # 筛选出入边
             in_edge_mask = sub_edges[1] == mapping[0]
             in_sub_edges = sub_edges[:, in_edge_mask]
@@ -179,12 +170,14 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 edge_mask=edge_mask[in_edge_mask],  # 子图的边在原图中的位置
                 p=power[sub_nodes]
             )
-
-            # 将子图添加到列表中
+            # utils.graph_showing(subgraph)  # 绘制一阶子图
             subgraph_list.append(subgraph)
         return subgraph_list
 
     # node achievable rate
+    # sg:subgraph 可暂定为一阶子图
+    # 注意用真实值计算，即data的y标签
+    # 所以使用norm数据训练是合理的
     def subgraph_rate(self, subgraph_list):
         subG_rate_list = []
         for subgraph in subgraph_list:
@@ -210,11 +203,49 @@ class DistributedMPNN(torch.nn.Module):  # per round
         subG_rate_list = self.subgraph_rate(subG_list)
         return subG_rate_list
 
+    def average_neighbor_gradients(self, node_grad_list, edge_index):
+        node_num = len(node_grad_list)
+        # 将 edge_index 转换为邻居字典
+        neighbors = {i: [] for i in range(node_num)}
+        for src, dst in edge_index.t().tolist():
+            neighbors[src].append(dst)
+        averaged_grad_list = []
+        for node_idx in range(node_num):
+            # 获取当前节点的梯度
+            current_grads = node_grad_list[node_idx]
+
+            # 获取邻居节点的梯度
+            neighbor_grads = []
+            for neighbor_idx in neighbors[node_idx]:
+                neighbor_grads.append(node_grad_list[neighbor_idx])
+
+            # 计算邻居梯度的平均值
+            if neighbor_grads:
+                # 对每个参数计算平均梯度
+                avg_grads = []
+                for param_idx in range(len(current_grads)):
+                    # 将所有邻居节点的对应参数梯度堆叠起来
+                    stacked_grads = torch.stack([grads[param_idx] for grads in neighbor_grads])
+                    # 计算平均值
+                    avg_grads.append(torch.mean(stacked_grads, dim=0))
+                averaged_grad_list.append(avg_grads)
+            else:
+                # 如果没有邻居节点，使用自身的梯度
+                averaged_grad_list.append(current_grads)
+
+        return averaged_grad_list
+
+    def update_gradients(self, averaged_grad_list):
+        for node_idx, node_model in enumerate(self.node_model_list):
+            for param, avg_grad in zip(node_model.parameters(), averaged_grad_list[node_idx]):
+                if param.grad is not None:
+                    param.grad.data = avg_grad.data  # 更新梯度
 
     def forward(self, data_list):
         for optimizer in self.optimizers: # 放这里合适吗？
             optimizer.zero_grad()
         for data in data_list:
+            # utils.graph_showing(data)
             x0, edge_attr, edge_index = data.x, data.edge_attr, data.edge_index
             x1 = self.localconv(x=x0, edge_index=edge_index, edge_attr=edge_attr)  # 第一个slot进行，对应Layer_1
             x2 = self.localconv(x=x1, edge_index=edge_index, edge_attr=edge_attr)
@@ -224,15 +255,26 @@ class DistributedMPNN(torch.nn.Module):  # per round
             local_rate_list = self.computeLocalRate(data, output)
             localRate = torch.stack(local_rate_list)
             sum_rate = localRate.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
+            model_index = 0
             for local_rate in local_rate_list:
+                # graph = make_dot(local_rate, params=dict(self.node_model_list[model_index].named_parameters()))
+                # graph.render("node0_model_graph")  # 保存计算图为 PDF 文件
                 local_rate.backward(retain_graph=True)
-        # grad_list = self.computeLocalGrad()  # 计算每个节点的本地梯度
-        # grad_avg = np.mean(grad_list)
+                # for param in self.node_model_list[model_index].parameters():
+                #     print(param.grad)
+                # for param in model.parameters():
+                #     print(param.grad)
+            node_grad_list = []
+            for node_model in self.node_model_list:
+                # node_grad_list.append({name: param.grad.clone() for name, param in node_model.named_parameters()})
+                node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+            node_avg_grad_list = self.average_neighbor_gradients(node_grad_list, edge_index)
+            self.update_gradients(node_avg_grad_list)
+            for optimizer in self.optimizers:
+                optimizer.step()
+            # for node_grad in node_grad_list:
+            #     print(node_grad)
         return sum_rate
-
-# 通过一阶子图，计算单个节点处的loss
-def node_loss():
-    pass
 
 # 针对梯度计算，可分为per_frame或per_layout
 # 两者类比于 SGD 和 mini-batch GD
@@ -290,15 +332,15 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = DistributedMPNN(train_K)
 # model_over_the_air = AirMPNN().to(device)  # 后续可以加入over the air模块
 
-for name, param in model.named_parameters():
-    print(f"Name: {name}")
-    print(f"Type: {type(param)}")
-    print(f"Size: {param.size()}")
-    print(f"Values: {param}")
+# for name, param in model.named_parameters():
+#     print(f"Name: {name}")
+#     print(f"Type: {type(param)}")
+#     print(f"Size: {param.size()}")
+#     print(f"Values: {param}")
 
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
 
 for epoch in range(1, 20):
     loss = train()
-    scheduler.step()
+    # scheduler.step()

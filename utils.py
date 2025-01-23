@@ -1,5 +1,7 @@
 import numpy as np
-
+import networkx as nx  # 用于可视化
+from torch_geometric.utils import to_networkx
+import matplotlib.pyplot as plt
 
 def standardize_train_data():
     pass
@@ -61,3 +63,15 @@ def get_directlink_losses(channel_losses):
     directlink_losses = np.array(directlink_losses)
     assert np.shape(directlink_losses)==(n, m)
     return directlink_losses
+
+def graph_showing(data):
+    '''
+    args:
+         data: torch_geometric.data.Data
+    '''
+    G = nx.Graph()
+    edge_index = data['edge_index'].t()
+    edge_index = np.array(edge_index.cpu())
+    G.add_edges_from(edge_index)
+    nx.draw_networkx(G)
+    plt.show()
