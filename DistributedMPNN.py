@@ -150,19 +150,19 @@ class DistributedMPNN(torch.nn.Module):  # per round
         # 初始化一个列表，用于存储每个节点的一阶子图
         subgraph_list = []
         for node_idx in range(data.num_nodes):
-            # 抽取一阶子图
+            # 抽取一阶子图，mapping是子图节点在原图中的索引, sub_node是子图节点在重新编号后的索引, 
+            # edge_mask是属于子图的边的mask，用于筛选哪些边属于子图
             sub_nodes, sub_edges, mapping, edge_mask = k_hop_subgraph(
                 node_idx=node_idx,
                 num_hops=1,
                 edge_index=data.edge_index,
                 relabel_nodes=True,  # 重新编号节点
-                # flow='source_to_target',  # 边的方向
-                flow='target_to_source',
+                flow='target_to_source',  # 边的方向
             )
 
             # 筛选出入边
             in_edge_mask = sub_edges[1] == mapping[0]
-            in_sub_edges = sub_edges[:, in_edge_mask]
+            in_sub_edges = sub_edges[:, in_edge_mask]  # 若in_edge_mask都为Fasle呢？
             in_edge_features = data.edge_attr[edge_mask][in_edge_mask]
 
             # edge_mask_test = edge_mask[in_edge_mask],  # 子图的边在原图中的位置
@@ -269,28 +269,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
             localRate = torch.stack(local_rate_list)
             sum_rate = localRate.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
             sum_loss += sum_rate.item()
-
-            # backward()
-            model_index = 0
-            for local_rate in local_rate_list:
-                # graph = make_dot(local_rate, params=dict(self.node_model_list[model_index].named_parameters()))
-                # graph.render("node0_model_graph")  # 保存计算图为 PDF 文件
-                local_rate.backward(retain_graph=True)
-                # for param in self.node_model_list[model_index].parameters():
-                #     print(param.grad)
-                # for param in model.parameters():
-                #     print(param.grad)
-            node_grad_list = []
-            for node_model in self.node_model_list:
-                # node_grad_list.append({name: param.grad.clone() for name, param in node_model.named_parameters()})
-                node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
-            node_avg_grad_list = self.average_neighbor_gradients(node_grad_list, edge_index)
-            self.update_gradients(node_avg_grad_list)
-            for optimizer in self.optimizers:
-                optimizer.step()
-            # for node_grad in node_grad_list:
-            #     print(node_grad)
-        return sum_loss
+        return sum_loss, local_rate_list
 
 # 针对梯度计算，可分为per_frame或per_layout
 # 两者类比于 SGD 和 mini-batch GD
@@ -300,7 +279,26 @@ def train():
     total_loss = 0
     for layout_data in train_loader:
         layout_data = [frame_data.to(device) for frame_data in layout_data]
-        total_sum_rate = model(layout_data)
+        total_sum_rate, local_rate_list = model(layout_data)  # 获取总损失和每个节点的损失列表
+
+        # 清除梯度缓存,若后期加入over-the-air，对比时可不用清楚累加
+        for optimizer in model.optimizers:
+            optimizer.zero_grad()
+
+        # 对每个节点的 local_rate 单独进行反向传播
+        for local_rate in local_rate_list:
+            local_rate.backward(retain_graph=True)
+        node_grad_list = []
+        for node_model in model.node_model_list:
+            node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+        # 计算邻居节点的平均梯度
+        node_avg_grad_list = model.average_neighbor_gradients(node_grad_list, layout_data[0].edge_index)
+        # 使用平均梯度更新模型参数
+        model.update_gradients(node_avg_grad_list)
+        # 更新模型参数
+        for optimizer in model.optimizers:
+            optimizer.step()
+
         total_loss += total_sum_rate
     loss_train = total_loss/train_layouts/frame_num
     return loss_train
@@ -313,7 +311,7 @@ def test():
     for layout_data in test_loader:
         layout_data = [frame_data.to(device) for frame_data in layout_data]
         with torch.no_grad():
-            total_sum_rate = model(layout_data)
+            total_sum_rate, _ = model(layout_data)
             total_loss += total_sum_rate
     loss_test = total_loss / test_layouts / frame_num
     return loss_test
