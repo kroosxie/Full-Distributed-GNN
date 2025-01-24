@@ -53,10 +53,17 @@ class LocalConv(MessagePassing):  # per layer
         for src, neigh_tmp in zip(edge_index[0], tmp):
             # 将message添加到对应源节点的列表中
             neigh_tmp_list[src.item()].append(neigh_tmp)
-        neigh_tmp_list = [torch.stack(neigh_tmps) if neigh_tmps else torch.tensor([]) for neigh_tmps in neigh_tmp_list]
+        # neigh_tmp_list = [torch.stack(neigh_tmps) if neigh_tmps else torch.tensor([]) for neigh_tmps in neigh_tmp_list]
+        # 注意，无边节点的维度存在问题
         for node_idx in range(node_num):
-            # 注意，无边节点的维度存在问题
-            # Todo：设置0阈值或者小阈值或者全连接，避免节点无连接的边的情况，后续再进一步考虑无连接节点的情况
+            if len(neigh_tmp_list[node_idx]) == 0:
+                # 如果没有邻居节点，生成一个全零张量
+                neigh_tmp_list[node_idx] = torch.zeros((1, tmp.shape[1]), device=x_i.device)
+            else:
+                # 如果有邻居节点，堆叠张量
+                neigh_tmp_list[node_idx] = torch.stack(neigh_tmp_list[node_idx])
+        # 计算每个节点的消息
+        for node_idx in range(node_num):
             node_msg_list[node_idx] = self.local_model_list[node_idx].mlp_m(neigh_tmp_list[node_idx])
             # neigh_msg_list.append(neigh_msg)  # 无边节点会出现问题
         return node_msg_list
@@ -158,7 +165,12 @@ class DistributedMPNN(torch.nn.Module):  # per round
             in_sub_edges = sub_edges[:, in_edge_mask]
             in_edge_features = data.edge_attr[edge_mask][in_edge_mask]
 
-            edge_mask_test = edge_mask[in_edge_mask],  # 子图的边在原图中的位置
+            # edge_mask_test = edge_mask[in_edge_mask],  # 子图的边在原图中的位置
+            # 处理没有入边的情况
+            if in_edge_mask.sum() == 0:  # 如果没有入边
+                edge_mask_subgraph = torch.tensor([], dtype=torch.bool, device=data.edge_index.device)
+            else:
+                edge_mask_subgraph = edge_mask[in_edge_mask]
 
             # 创建子图的 Data 对象
             subgraph = Data(
@@ -167,7 +179,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 edge_index=in_sub_edges,  # 子图的边连接信息
                 edge_attr=in_edge_features,
                 mapping=mapping,  # 目标节点在子图中的位置
-                edge_mask=edge_mask[in_edge_mask],  # 子图的边在原图中的位置
+                edge_mask=edge_mask_subgraph,  # 子图的边在原图中的位置
                 p=power[sub_nodes]
             )
             # utils.graph_showing(subgraph)  # 绘制一阶子图
@@ -242,6 +254,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
                     param.grad.data = avg_grad.data  # 更新梯度
 
     def forward(self, data_list):
+        sum_loss = 0
         for optimizer in self.optimizers: # 放这里合适吗？
             optimizer.zero_grad()
         for data in data_list:
@@ -255,6 +268,9 @@ class DistributedMPNN(torch.nn.Module):  # per round
             local_rate_list = self.computeLocalRate(data, output)
             localRate = torch.stack(local_rate_list)
             sum_rate = localRate.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
+            sum_loss += sum_rate.item()
+
+            # backward()
             model_index = 0
             for local_rate in local_rate_list:
                 # graph = make_dot(local_rate, params=dict(self.node_model_list[model_index].named_parameters()))
@@ -274,7 +290,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 optimizer.step()
             # for node_grad in node_grad_list:
             #     print(node_grad)
-        return sum_rate
+        return sum_loss
 
 # 针对梯度计算，可分为per_frame或per_layout
 # 两者类比于 SGD 和 mini-batch GD
@@ -282,37 +298,48 @@ class DistributedMPNN(torch.nn.Module):  # per round
 def train():
     model.train()
     total_loss = 0
-    # optimizers = [optim.SGD(mlp.parameters(), lr=0.01) for mlp in mlp_list]
     for layout_data in train_loader:
-        for frame_data in layout_data:
-            frame_data = frame_data.to(device)
-            # p_out, grad_out = model(frame_data) # 该p_out可用于训练过程中真实调整发射功率，也可仅用于传值计算loss
-        # optimizer.zero_grad()  # ? 需要吗
-        p_out, grad_out = model(layout_data)
+        layout_data = [frame_data.to(device) for frame_data in layout_data]
+        total_sum_rate = model(layout_data)
+        total_loss += total_sum_rate
+    loss_train = total_loss/train_layouts/frame_num
+    return loss_train
 
-
+def test():
+    model.eval()  # 将模型设置为评估模式：即固定参数
+    # 感觉不对，因为在模型里面使用了更新策略
+    # if model.eval，把里面的更新阶段注释掉
+    total_loss = 0
+    for layout_data in test_loader:
+        layout_data = [frame_data.to(device) for frame_data in layout_data]
+        with torch.no_grad():
+            total_sum_rate = model(layout_data)
+            total_loss += total_sum_rate
+    loss_test = total_loss / test_layouts / frame_num
+    return loss_test
 
 train_K = 20
 train_layouts = 100  # 模拟拓扑结构变化
+test_layouts = 5
 frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
 train_config = init_parameters()
 var = train_config.output_noise_power / train_config.tx_power
 
 # Train data generation
+'''
 # layouts彼此间地理拓扑结构不同
 # 一个layout中分为多个frames，frame间地理拓扑相同，快衰落不同，但有关联。
 # 若建立子图时使用距离阈值，可保证同一个layout下的图拓扑一致，但使用一阶子图计算时可能忽略某些较大干扰信道；
 # 若建立子图时使用信道loss阈值，计算节点损失函数时意义明确，但拓扑信息存在变动。
 # 目前使用的是channel loss阈值
-print('Train data generation')
+'''
 train_channel_losses = D2D.train_channel_loss_generator_1(train_config, train_layouts, frame_num) # 真实信道
 # train_losses_simplified = D2D.train_channel_loss_generator_2(train_layouts, train_frames, D2DNum_K) # 简易信道（仿真使用）
 # train_directlink_losses = utils.get_directlink_losses(train_losses_simplified)
 
 # Data standardization/normalization
 norm_train_loss = utils.normalize_train_data(train_channel_losses)
-
 
 # Graph data processing
 print('Graph data processing')
@@ -332,15 +359,18 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = DistributedMPNN(train_K)
 # model_over_the_air = AirMPNN().to(device)  # 后续可以加入over the air模块
 
-# for name, param in model.named_parameters():
-#     print(f"Name: {name}")
-#     print(f"Type: {type(param)}")
-#     print(f"Size: {param.size()}")
-#     print(f"Values: {param}")
-
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
 
+# Test data generation
+test_channel_losses = D2D.train_channel_loss_generator_1(train_config, test_layouts, frame_num) # 真实信道
+norm_test_loss = utils.normalize_train_data(test_channel_losses)
+test_data_list = Gbld.proc_data_distributed_pc(test_channel_losses, norm_test_loss, train_K, graph_embedding_size)
+test_loader = DataLoader(test_data_list, batch_size=1, shuffle=False, num_workers=0)
+
+
 for epoch in range(1, 20):
-    loss = train()
+    loss_1 = train()
     # scheduler.step()
+    loss_2 = test()
+    print("hahha")

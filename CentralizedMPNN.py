@@ -46,8 +46,6 @@ def sr_loss(train_data, out_p, K):
     loss = torch.neg(sr)
     return loss
 
-
-
 def train():
     model.train()
     total_loss = 0
@@ -60,7 +58,6 @@ def train():
         total_loss += loss.item() * data.num_graphs  # 为什么要乘？因为在sr_rate中有mean，所以可以直接乘
         optimizer.step()
     return total_loss / train_layouts / frame_num
-        
 
 def MLP(channels, batch_norm=True):
     return Seq(*[
