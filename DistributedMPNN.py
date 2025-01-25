@@ -150,39 +150,28 @@ class DistributedMPNN(torch.nn.Module):  # per round
         # 初始化一个列表，用于存储每个节点的一阶子图
         subgraph_list = []
         for node_idx in range(data.num_nodes):
-            # 抽取一阶子图，mapping是子图节点在原图中的索引, sub_node是子图节点在重新编号后的索引, 
+            # 抽取一阶子图，mapping是子图节点在原图中的索引, sub_node是子图节点在重新编号后的索引,
             # edge_mask是属于子图的边的mask，用于筛选哪些边属于子图
             sub_nodes, sub_edges, mapping, edge_mask = k_hop_subgraph(
                 node_idx=node_idx,
                 num_hops=1,
                 edge_index=data.edge_index,
                 relabel_nodes=True,  # 重新编号节点
+                num_nodes=data.num_nodes,
                 flow='target_to_source',  # 边的方向
             )
-
             # 筛选出入边
             in_edge_mask = sub_edges[1] == mapping[0]
-            in_sub_edges = sub_edges[:, in_edge_mask]  # 若in_edge_mask都为Fasle呢？
-            in_edge_features = data.edge_attr[edge_mask][in_edge_mask]
-
-            # edge_mask_test = edge_mask[in_edge_mask],  # 子图的边在原图中的位置
-            # 处理没有入边的情况
-            if in_edge_mask.sum() == 0:  # 如果没有入边
-                edge_mask_subgraph = torch.tensor([], dtype=torch.bool, device=data.edge_index.device)
-            else:
-                edge_mask_subgraph = edge_mask[in_edge_mask]
-
             # 创建子图的 Data 对象
             subgraph = Data(
-                x=data.x[sub_nodes],  # 子图的节点特征
-                y=data.y[:,mapping, sub_nodes],  # 暂时只能用于全连接图，需要后续验证及改进
-                edge_index=in_sub_edges,  # 子图的边连接信息
-                edge_attr=in_edge_features,
-                mapping=mapping,  # 目标节点在子图中的位置
-                edge_mask=edge_mask_subgraph,  # 子图的边在原图中的位置
+                x=data.x[sub_nodes],
+                y=data.y[:, mapping, sub_nodes],
+                edge_index=sub_edges[:, in_edge_mask],
+                edge_attr=data.edge_attr[edge_mask][in_edge_mask],
+                mapping=mapping,
+                # edge_mask=edge_mask_subgraph,
                 p=power[sub_nodes]
             )
-            # utils.graph_showing(subgraph)  # 绘制一阶子图
             subgraph_list.append(subgraph)
         return subgraph_list
 
