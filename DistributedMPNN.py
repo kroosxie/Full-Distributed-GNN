@@ -8,15 +8,14 @@ from torch_geometric.nn.conv import MessagePassing
 from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, BatchNorm1d as BN
 from torch_geometric.utils import k_hop_subgraph
 from torch_geometric.data import Data
-
 from torchviz import make_dot
 
 # 真实版信道生成
 class init_parameters():
     def __init__(self):
         # wireless network settings
-        self.n_links = train_K  # 这里是D2D直连链路数目
-        self.field_length = 1000
+        self.n_links = train_K  # D2D direct link
+        self.field_length = 400
         self.shortest_directLink_length = 2
         self.longest_directLink_length = 40
         self.shortest_crossLink_length = 1  # crosslink即干扰链路，设置最小干扰链路距离防止产生过大的干扰
@@ -35,7 +34,6 @@ class init_parameters():
                                                                 self.longest_directLink_length)
 
 # 整图输入，整图输出
-# 该类实现MessagePassing的过程
 # 使用一跳子图
 # 考虑实际训练的噪声？
 # 可能需要节点list
@@ -47,25 +45,18 @@ class LocalConv(MessagePassing):  # per layer
     def message(self, x_i, x_j, edge_attr, edge_index): # x_i为所有边的源节点，x_j为所有边的目标节点
         node_num = len(self.local_model_list)
         tmp = torch.cat([x_j, edge_attr], dim=1)
-        edge_num = tmp.shape[0]
         neigh_tmp_list = [[] for _ in range(node_num)]
         node_msg_list = [[] for _ in range(node_num)]
         for src, neigh_tmp in zip(edge_index[0], tmp):
-            # 将message添加到对应源节点的列表中
-            neigh_tmp_list[src.item()].append(neigh_tmp)
-        # neigh_tmp_list = [torch.stack(neigh_tmps) if neigh_tmps else torch.tensor([]) for neigh_tmps in neigh_tmp_list]
-        # 注意，无边节点的维度存在问题
+            neigh_tmp_list[src.item()].append(neigh_tmp) # 将message添加到对应源节点的列表中
         for node_idx in range(node_num):
             if len(neigh_tmp_list[node_idx]) == 0:
-                # 如果没有邻居节点，生成一个全零张量
-                neigh_tmp_list[node_idx] = torch.zeros((1, tmp.shape[1]), device=x_i.device)
+                neigh_tmp_list[node_idx] = torch.zeros((1, tmp.shape[1]), device=x_i.device) # 若无邻居节点，生成全零张量
             else:
-                # 如果有邻居节点，堆叠张量
                 neigh_tmp_list[node_idx] = torch.stack(neigh_tmp_list[node_idx])
         # 计算每个节点的消息
         for node_idx in range(node_num):
             node_msg_list[node_idx] = self.local_model_list[node_idx].mlp_m(neigh_tmp_list[node_idx])
-            # neigh_msg_list.append(neigh_msg)  # 无边节点会出现问题
         return node_msg_list
 
     def aggregate(self, node_msg_list, aggr = 'sum'):  # 聚合方式暂设为sum，可与over-the-air适配
@@ -104,8 +95,8 @@ def MLP(channels, batch_norm=True):
         for i in range(1, len(channels))
     ])
 
-# 每个节点上都有自身的MLP_M和MLP_U
-# 若共享参数的话，意味着每一层共享一个MLP_m和MLP_u
+# 每个节点上都有自身的MLP_M和MLP_U，假设共享参数
+# 若共享参数的话，意味着各层共享一个MLP_m和MLP_u
 class LocalModel(torch.nn.Module):
     def __init__(self):
         super(LocalModel, self).__init__()
@@ -133,7 +124,6 @@ class LocalH2O(torch.nn.Module):  # 需要继承吗？
 class DistributedMPNN(torch.nn.Module):  # per round
     def __init__(self, node_num):
         super(DistributedMPNN, self).__init__()
-        # self.node_model_list = []
         self.node_model_list = torch.nn.ModuleList()
         for i in range(node_num):
             node_model = LocalModel().to(device)  # per node
@@ -142,8 +132,9 @@ class DistributedMPNN(torch.nn.Module):  # per round
         self.localconv = LocalConv(self.node_model_list).to(device)
         self.localh2o = LocalH2O(self.node_model_list).to(device)
         # 创建优化器列表，每个 node_model 一个优化器
-        # self.optimizers = [torch.optim.SGD(node_model.parameters(), lr=0.01) for node_model in self.node_model_list]
+        # self.optimizers = [torch.optim.SGD(node_model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4) for node_model in self.node_model_list]
         self.optimizers = [torch.optim.Adam(node_model.parameters(), lr=0.002) for node_model in self.node_model_list]
+        self.schedulers = [torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9) for optimizer in self.optimizers] # 学习率调整
 
     # 提取子图，暂定一阶
     def collect_subgraph(self, data, power):
@@ -169,7 +160,6 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 edge_index=sub_edges[:, in_edge_mask],
                 edge_attr=data.edge_attr[edge_mask][in_edge_mask],
                 mapping=mapping,
-                # edge_mask=edge_mask_subgraph,
                 p=power[sub_nodes]
             )
             subgraph_list.append(subgraph)
@@ -177,14 +167,13 @@ class DistributedMPNN(torch.nn.Module):  # per round
 
     # node achievable rate
     # sg:subgraph 可暂定为一阶子图
-    # 注意用真实值计算，即data的y标签
-    # 所以使用norm数据训练是合理的
+    # 注意用真实值计算，即data的y标签 所以使用norm数据训练是合理的
     def subgraph_rate(self, subgraph_list):
         subG_rate_list = []
         for subgraph in subgraph_list:
             power = subgraph.p
             abs_H_2 = subgraph.y
-            abs_H_2 = abs_H_2.t()
+            abs_H_2 = abs_H_2.t()  # 为什么要转置？
             rx_power = torch.mul(power, abs_H_2)
             valid_rx_power = rx_power[subgraph.mapping]
             interference = rx_power.sum()-valid_rx_power + var
@@ -204,6 +193,17 @@ class DistributedMPNN(torch.nn.Module):  # per round
         subG_rate_list = self.subgraph_rate(subG_list)
         return subG_rate_list
 
+    def computeFrameRate(self, abs_H_2 , out_p):
+        K = out_p.shape[0]
+        abs_H_2 = abs_H_2.squeeze(dim=0).t() # 注意需要转置对应
+        rx_power = torch.mul(abs_H_2, out_p)
+        mask = torch.eye(K)
+        valid_rx_power = torch.sum(torch.mul(rx_power, mask), 1)  # valid:有效信号
+        interference = torch.sum(torch.mul(rx_power, 1 - mask), 1) + var
+        rate = torch.log2(1 + torch.div(valid_rx_power, interference))
+        fr = torch.sum(rate, 0)
+        return fr
+
     def average_neighbor_gradients(self, node_grad_list, edge_index):
         node_num = len(node_grad_list)
         # 将 edge_index 转换为邻居字典
@@ -214,7 +214,6 @@ class DistributedMPNN(torch.nn.Module):  # per round
         for node_idx in range(node_num):
             # 获取当前节点的梯度
             current_grads = node_grad_list[node_idx]
-
             # 获取邻居节点的梯度
             neighbor_grads = []
             for neighbor_idx in neighbors[node_idx]:
@@ -243,9 +242,8 @@ class DistributedMPNN(torch.nn.Module):  # per round
                     param.grad.data = avg_grad.data  # 更新梯度
 
     def forward(self, data_list):
-        sum_loss = 0
-        for optimizer in self.optimizers: # 放这里合适吗？
-            optimizer.zero_grad()
+        layout_rate = 0
+        # sum_loss = 0
         for data in data_list:
             # utils.graph_showing(data)
             x0, edge_attr, edge_index = data.x, data.edge_attr, data.edge_index
@@ -254,25 +252,27 @@ class DistributedMPNN(torch.nn.Module):  # per round
             out = self.localconv(x=x2, edge_index=edge_index, edge_attr=edge_attr)
             # 该p_out可用于训练过程中真实调整发射功率，也可仅用于传值计算loss
             output = self.localh2o(out[:, 1:])
-            local_rate_list = self.computeLocalRate(data, output)
-            localRate = torch.stack(local_rate_list)
-            sum_rate = localRate.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
-            sum_loss += sum_rate.item()
-        return sum_loss, local_rate_list
+            local_rate_list = self.computeLocalRate(data, output)  # 由于子图计算，与真实存在偏差
+            frame_rate = self.computeFrameRate(data.y, output)  # 真实速率
+            layout_rate += frame_rate.item()
+            # localRate = torch.stack(local_rate_list)
+            # sum_rate = localRate.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
+            # sum_loss += sum_rate.item()
+        return layout_rate, local_rate_list
 
 # 针对梯度计算，可分为per_frame或per_layout
 # 两者类比于 SGD 和 mini-batch GD
 # 暂定per_layout
 def train():
     model.train()
-    total_loss = 0
+    total_rate = 0
     for layout_data in train_loader:
         layout_data = [frame_data.to(device) for frame_data in layout_data]
-        total_sum_rate, local_rate_list = model(layout_data)  # 获取总损失和每个节点的损失列表
-
         # 清除梯度缓存,若后期加入over-the-air，对比时可不用清楚累加
         for optimizer in model.optimizers:
             optimizer.zero_grad()
+
+        layout_sum_rate, local_rate_list = model(layout_data)  # 获取真实和速率和每个节点的损失列表
 
         # 对每个节点的 local_rate 单独进行反向传播
         for local_rate in local_rate_list:
@@ -287,31 +287,29 @@ def train():
         # 更新模型参数
         for optimizer in model.optimizers:
             optimizer.step()
-
-        total_loss += total_sum_rate
-    loss_train = total_loss/train_layouts/frame_num
-    return loss_train
+        total_rate += layout_sum_rate
+    train_rate = total_rate/train_layouts/frame_num
+    return train_rate  # 真实rate，非用于反向传播的loss
 
 def test():
     model.eval()  # 将模型设置为评估模式：即固定参数
-    # 感觉不对，因为在模型里面使用了更新策略
-    # if model.eval，把里面的更新阶段注释掉
-    total_loss = 0
+    total_rate = 0
     for layout_data in test_loader:
         layout_data = [frame_data.to(device) for frame_data in layout_data]
         with torch.no_grad():
-            total_sum_rate, _ = model(layout_data)
-            total_loss += total_sum_rate
-    loss_test = total_loss / test_layouts / frame_num
-    return loss_test
+            layout_sum_rate, _ = model(layout_data)
+            total_rate += layout_sum_rate
+    test_rate = total_rate / test_layouts / frame_num
+    return test_rate  # 真实rate
+
 
 train_K = 20
-train_layouts = 100  # 模拟拓扑结构变化
-test_layouts = 5
+train_layouts = 1000  # 模拟拓扑结构变化
+test_layouts = 50
 frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
 train_config = init_parameters()
-var = train_config.output_noise_power / train_config.tx_power
+var = train_config.output_noise_power / train_config.tx_power # 噪声归一化
 
 # Train data generation
 '''
@@ -332,7 +330,6 @@ norm_train_loss = utils.normalize_train_data(train_channel_losses)
 print('Graph data processing')
 # 构建部分连接图，即干扰链路小于阈值的边忽略不计
 train_data_list = Gbld.proc_data_distributed_pc(train_channel_losses, norm_train_loss, train_K, graph_embedding_size)
-# local_graph_list = Gbld.collect_subgraph(global_graph_partially_connected)  # 挑选并构建本地的子图（一跳或多跳）,并构成一个list
 # batchsize暂设为1，简化逻辑，适应动态图
 # batchsize=1有必要吗？需要进一步看看channel生成过程，确定layouts，frames之间的关系
 # 后续可以再尝试调整
@@ -342,22 +339,56 @@ train_loader = DataLoader(train_data_list, batch_size=1, shuffle=False, num_work
 
 # Local training
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# model = DistributedMPNN(train_K).to(device)  # 基础本地模型
-model = DistributedMPNN(train_K)
+model = DistributedMPNN(train_K).to(device)  # 基础本地模型
 # model_over_the_air = AirMPNN().to(device)  # 后续可以加入over the air模块
 
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
-# scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
-
 # Test data generation
-test_channel_losses = D2D.train_channel_loss_generator_1(train_config, test_layouts, frame_num) # 真实信道
+test_config = init_parameters()
+test_K = train_K
+test_channel_losses = D2D.train_channel_loss_generator_1(test_config, test_layouts, frame_num) # 真实信道
 norm_test_loss = utils.normalize_train_data(test_channel_losses)
-test_data_list = Gbld.proc_data_distributed_pc(test_channel_losses, norm_test_loss, train_K, graph_embedding_size)
+test_data_list = Gbld.proc_data_distributed_pc(test_channel_losses, norm_test_loss, test_K, graph_embedding_size)
 test_loader = DataLoader(test_data_list, batch_size=1, shuffle=False, num_workers=0)
 
 
-for epoch in range(1, 20):
-    loss_1 = train()
-    # scheduler.step()
-    loss_2 = test()
-    print("hahha")
+#test for epa(train)
+Pepa = np.ones((train_layouts, frame_num, train_K))
+rates_epa = utils.compute_rates(train_config, Pepa, train_channel_losses)
+sum_rate_epa = np.mean(np.sum(rates_epa, axis=2))
+print('EPA average sum rate:',sum_rate_epa)
+
+#test for epa
+Pepa = np.ones((test_layouts, frame_num, test_K))
+rates_epa = utils.compute_rates(test_config, Pepa, test_channel_losses)
+sum_rate_epa = np.mean(np.sum(rates_epa, axis=2))
+print('EPA average sum rate (test):',sum_rate_epa)
+
+#test for wmmse
+Pini = np.random.rand(test_layouts, frame_num, test_K, 1)
+Y1 = utils.batch_WMMSE(Pini,np.ones([test_layouts*frame_num, test_K]),np.sqrt(test_channel_losses),1,var)
+Y2 = Y1.reshape(test_layouts, frame_num, test_K)
+rates_wmmse = utils.compute_rates(test_config, Y2, test_channel_losses)
+sum_rate_wmmse = np.mean(np.sum(rates_wmmse,axis=1))
+print('WMMSE average sum rate:',sum_rate_wmmse)
+
+
+
+# for epoch in range(1, 3):  # 但实际情况中，应该没有epoch，每个数据都是实时的
+#     loss_1 = train()
+#     for scheduler in model.schedulers:
+#         scheduler.step()
+#     print(f"epoch: {epoch} train_rate: {loss_1}")
+
+# 真实情况应该是有足够多的layout数目
+# 若与集中式比较，将layouts数目设为集中式的train_layouts*epoch
+# 若需要调整学习率，可在一定的一定数量的layouts后进行scheduler，这样的话是不是和batchsize能够进行融合？
+loss_1 = train()
+print(f"train_rate: {loss_1}")
+
+loss_2 = test()
+print(f"test_rate: {loss_2}")
+
+
+
+
+

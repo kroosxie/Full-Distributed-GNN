@@ -75,3 +75,119 @@ def graph_showing(data):
     G.add_edges_from(edge_index)
     nx.draw_networkx(G)
     plt.show()
+
+def compute_SINRs(general_para, allocs, directlink_channel_losses, crosslink_channel_losses):
+    # assert np.shape(directlink_channel_losses) == np.shape(allocs), \
+    #     "Mismatch shapes: {} VS {}".format(np.shape(directlink_channel_losses), np.shape(allocs))
+    SINRs_numerators = allocs * directlink_channel_losses
+    SINRs_denominators = np.squeeze(np.matmul(crosslink_channel_losses, np.expand_dims(allocs, axis=-1))) + general_para.output_noise_power / general_para.tx_power  # layouts X N
+    SINRs = SINRs_numerators / SINRs_denominators
+    return SINRs
+
+def compute_rates(general_para, allocs, channel_losses):
+    directlink_channel_losses = np.diagonal(channel_losses, axis1=2, axis2=3)
+    N = np.shape(channel_losses)[-1]
+    crosslink_channel_losses = channel_losses * ((np.identity(N) < 1).astype(float))
+    SINRs = compute_SINRs(general_para, allocs, directlink_channel_losses, crosslink_channel_losses)
+    rates = np.log2(1 + SINRs)
+    return rates
+
+
+# def batch_WMMSE(p_int, alpha, H, Pmax, var_noise):
+#     N = p_int.shape[0]
+#     K = p_int.shape[1]
+#     vnew = 0
+#     b = np.sqrt(p_int)
+#     f = np.zeros((N, K, 1))
+#     w = np.zeros((N, K, 1))
+# 
+#     mask = np.eye(K)
+#     rx_power = np.multiply(H, b)
+#     rx_power_s = np.square(rx_power)
+#     valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
+# 
+#     interference = np.sum(rx_power_s, 2) + var_noise
+#     f = np.divide(valid_rx_power, interference)
+#     w = 1 / (1 - np.multiply(f, valid_rx_power))
+#     # vnew = np.sum(np.log2(w),1)
+# 
+#     for ii in range(100):
+#         fp = np.expand_dims(f, 1)
+#         rx_power = np.multiply(H.transpose(0, 2, 1), fp)
+#         valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
+#         bup = np.multiply(alpha, np.multiply(w, valid_rx_power))
+#         rx_power_s = np.square(rx_power)
+#         wp = np.expand_dims(w, 1)
+#         alphap = np.expand_dims(alpha, 1)
+#         bdown = np.sum(np.multiply(alphap, np.multiply(rx_power_s, wp)), 2)
+#         btmp = bup / bdown
+#         b = np.minimum(btmp, np.ones((N, K)) * np.sqrt(Pmax)) + np.maximum(btmp, np.zeros((N, K))) - btmp
+# 
+#         bp = np.expand_dims(b, 1)
+#         rx_power = np.multiply(H, bp)
+#         rx_power_s = np.square(rx_power)
+#         valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
+#         interference = np.sum(rx_power_s, 2) + var_noise
+#         f = np.divide(valid_rx_power, interference)
+#         w = 1 / (1 - np.multiply(f, valid_rx_power))
+#     p_opt = np.square(b)
+#     return p_opt
+
+def batch_WMMSE(p_int, alpha, H, Pmax, var_noise):
+    # 保存原始形状用于最后恢复维度
+    original_shape = p_int.shape  # (test_layouts, frame_num, K, 1)
+
+    # 展平前两个维度 (test_layouts, frame_num) -> N = test_layouts*frame_num
+    N_total = original_shape[0] * original_shape[1]
+    K = original_shape[2]
+
+    # 将四维输入重整为三维 (N_total, K, 1)
+    p_int_flat = p_int.reshape(N_total, K, 1)
+    alpha_flat = alpha.reshape(N_total, K)
+    H_flat = H.reshape(N_total, K, K)  # 假设输入H的原始形状为 (test_layouts, frame_num, K, K)
+
+    # 后续保持原始算法逻辑不变
+    N = p_int_flat.shape[0]
+    b = np.sqrt(p_int_flat)
+    f = np.zeros((N, K, 1))
+    w = np.zeros((N, K, 1))
+
+    mask = np.eye(K)
+
+    # 关键维度转换点 (保持核心计算三维)
+    rx_power = np.multiply(H_flat, b)
+    rx_power_s = np.square(rx_power)
+    valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
+
+    interference = np.sum(rx_power_s, 2) + var_noise
+    f = np.divide(valid_rx_power, interference)
+    w = 1 / (1 - np.multiply(f, valid_rx_power))
+
+    for ii in range(100):
+        fp = np.expand_dims(f, 1)  # (N, 1, K, 1)
+        rx_power = np.multiply(H_flat.transpose(0, 2, 1), fp)  # 保持三维转置
+        valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
+
+        bup = np.multiply(alpha_flat, np.multiply(w, valid_rx_power))
+        rx_power_s = np.square(rx_power)
+
+        wp = np.expand_dims(w, 1)
+        alphap = np.expand_dims(alpha_flat, 1)
+        bdown = np.sum(np.multiply(alphap, np.multiply(rx_power_s, wp)), 2)
+
+        btmp = bup / bdown
+        b = np.minimum(btmp, np.ones((N, K)) * np.sqrt(Pmax)) \
+            + np.maximum(btmp, np.zeros((N, K))) - btmp
+
+        bp = np.expand_dims(b, 1)
+        rx_power = np.multiply(H_flat, bp)
+        rx_power_s = np.square(rx_power)
+        valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
+
+        interference = np.sum(rx_power_s, 2) + var_noise
+        f = np.divide(valid_rx_power, interference)
+        w = 1 / (1 - np.multiply(f, valid_rx_power))
+
+    # 恢复四维输出形状
+    p_opt = np.square(b).reshape(original_shape)  # (test_layouts, frame_num, K, 1)
+    return p_opt

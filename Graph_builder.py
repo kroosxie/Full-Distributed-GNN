@@ -47,8 +47,8 @@ def partially_connected_graph_builder(loss, std_H, K, graph_embedding_size):
 
     # 滤除小于阈值的边
     # 如果出现某节点的所有的临边都被滤除的情况怎么办？
-    # threshold_rate = 0.8
-    threshold_rate = 3
+    threshold_rate = 0.8
+    # threshold_rate = 3
     threshold = edge_attr_avg * threshold_rate
     mask_filter = edge_attr.squeeze() > threshold
     filtered_edge_attr = edge_attr[mask_filter]
