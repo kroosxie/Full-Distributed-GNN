@@ -34,10 +34,10 @@ def normalize_train_data(train_data):
 #     return std_train
 
 # 训练数据归一化
-
-def normalize_centralized_train_data(squared_train_data, train_K):
+# pro版可能更能采集直连链路特征
+def normalize_data_pro(squared_train_data, K):
     # normalize train directlink
-    mask = np.eye(train_K) 
+    mask = np.eye(K) 
     train_copy = np.copy(squared_train_data) 
     diag_H = np.multiply(mask, train_copy)  
     diag_H_max = np.max(diag_H)
@@ -91,47 +91,6 @@ def compute_rates(general_para, allocs, channel_losses):
     SINRs = compute_SINRs(general_para, allocs, directlink_channel_losses, crosslink_channel_losses)
     rates = np.log2(1 + SINRs)
     return rates
-
-
-# def batch_WMMSE(p_int, alpha, H, Pmax, var_noise):
-#     N = p_int.shape[0]
-#     K = p_int.shape[1]
-#     vnew = 0
-#     b = np.sqrt(p_int)
-#     f = np.zeros((N, K, 1))
-#     w = np.zeros((N, K, 1))
-# 
-#     mask = np.eye(K)
-#     rx_power = np.multiply(H, b)
-#     rx_power_s = np.square(rx_power)
-#     valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
-# 
-#     interference = np.sum(rx_power_s, 2) + var_noise
-#     f = np.divide(valid_rx_power, interference)
-#     w = 1 / (1 - np.multiply(f, valid_rx_power))
-#     # vnew = np.sum(np.log2(w),1)
-# 
-#     for ii in range(100):
-#         fp = np.expand_dims(f, 1)
-#         rx_power = np.multiply(H.transpose(0, 2, 1), fp)
-#         valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
-#         bup = np.multiply(alpha, np.multiply(w, valid_rx_power))
-#         rx_power_s = np.square(rx_power)
-#         wp = np.expand_dims(w, 1)
-#         alphap = np.expand_dims(alpha, 1)
-#         bdown = np.sum(np.multiply(alphap, np.multiply(rx_power_s, wp)), 2)
-#         btmp = bup / bdown
-#         b = np.minimum(btmp, np.ones((N, K)) * np.sqrt(Pmax)) + np.maximum(btmp, np.zeros((N, K))) - btmp
-# 
-#         bp = np.expand_dims(b, 1)
-#         rx_power = np.multiply(H, bp)
-#         rx_power_s = np.square(rx_power)
-#         valid_rx_power = np.sum(np.multiply(rx_power, mask), 1)
-#         interference = np.sum(rx_power_s, 2) + var_noise
-#         f = np.divide(valid_rx_power, interference)
-#         w = 1 / (1 - np.multiply(f, valid_rx_power))
-#     p_opt = np.square(b)
-#     return p_opt
 
 def batch_WMMSE(p_int, alpha, H, Pmax, var_noise):
     # 保存原始形状用于最后恢复维度

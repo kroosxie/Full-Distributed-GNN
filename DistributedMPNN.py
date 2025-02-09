@@ -168,7 +168,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
     # node achievable rate
     # sg:subgraph 可暂定为一阶子图
     # 注意用真实值计算，即data的y标签 所以使用norm数据训练是合理的
-    def subgraph_rate(self, subgraph_list):
+    def subgraph_rate(self, subgraph_list):  # 其实是node_rate而非subgraph的sum_rate
         subG_rate_list = []
         for subgraph in subgraph_list:
             power = subgraph.p
@@ -268,22 +268,24 @@ def train():
     total_rate = 0
     for layout_data in train_loader:
         layout_data = [frame_data.to(device) for frame_data in layout_data]
-        # 清除梯度缓存,若后期加入over-the-air，对比时可不用清楚累加
+        # 清除梯度缓存,若后期加入over-the-air，对比时可不用清除累加
         for optimizer in model.optimizers:
             optimizer.zero_grad()
-
         layout_sum_rate, local_rate_list = model(layout_data)  # 获取真实和速率和每个节点的损失列表
-
         # 对每个节点的 local_rate 单独进行反向传播
         for local_rate in local_rate_list:
             local_rate.backward(retain_graph=True)
+
+        此处需要好好思考
         node_grad_list = []
         for node_model in model.node_model_list:
             node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+        # 感觉这样更新梯度过于频繁，可能会失效
         # 计算邻居节点的平均梯度
         node_avg_grad_list = model.average_neighbor_gradients(node_grad_list, layout_data[0].edge_index)
         # 使用平均梯度更新模型参数
         model.update_gradients(node_avg_grad_list)
+
         # 更新模型参数
         for optimizer in model.optimizers:
             optimizer.step()
@@ -304,7 +306,7 @@ def test():
 
 
 train_K = 20
-train_layouts = 1000  # 模拟拓扑结构变化
+train_layouts = 100  # 模拟拓扑结构变化
 test_layouts = 50
 frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
@@ -325,6 +327,7 @@ train_channel_losses = D2D.train_channel_loss_generator_1(train_config, train_la
 
 # Data standardization/normalization
 norm_train_loss = utils.normalize_train_data(train_channel_losses)
+# norm_train_loss = utils.normalize_data_pro(train_channel_losses, train_K)  # 对直连和干扰信道分别norm
 
 # Graph data processing
 print('Graph data processing')
@@ -347,6 +350,7 @@ test_config = init_parameters()
 test_K = train_K
 test_channel_losses = D2D.train_channel_loss_generator_1(test_config, test_layouts, frame_num) # 真实信道
 norm_test_loss = utils.normalize_train_data(test_channel_losses)
+# norm_test_loss = utils.normalize_data_pro(test_channel_losses, test_K)
 test_data_list = Gbld.proc_data_distributed_pc(test_channel_losses, norm_test_loss, test_K, graph_embedding_size)
 test_loader = DataLoader(test_data_list, batch_size=1, shuffle=False, num_workers=0)
 
@@ -355,22 +359,13 @@ test_loader = DataLoader(test_data_list, batch_size=1, shuffle=False, num_worker
 Pepa = np.ones((train_layouts, frame_num, train_K))
 rates_epa = utils.compute_rates(train_config, Pepa, train_channel_losses)
 sum_rate_epa = np.mean(np.sum(rates_epa, axis=2))
-print('EPA average sum rate:',sum_rate_epa)
+print('EPA average sum rate:', sum_rate_epa)
 
-#test for epa
-Pepa = np.ones((test_layouts, frame_num, test_K))
-rates_epa = utils.compute_rates(test_config, Pepa, test_channel_losses)
-sum_rate_epa = np.mean(np.sum(rates_epa, axis=2))
-print('EPA average sum rate (test):',sum_rate_epa)
-
-#test for wmmse
-Pini = np.random.rand(test_layouts, frame_num, test_K, 1)
-Y1 = utils.batch_WMMSE(Pini,np.ones([test_layouts*frame_num, test_K]),np.sqrt(test_channel_losses),1,var)
-Y2 = Y1.reshape(test_layouts, frame_num, test_K)
-rates_wmmse = utils.compute_rates(test_config, Y2, test_channel_losses)
-sum_rate_wmmse = np.mean(np.sum(rates_wmmse,axis=1))
-print('WMMSE average sum rate:',sum_rate_wmmse)
-
+#test for random(train)
+Prand = np.random.rand(train_layouts, frame_num, train_K)
+rates_rand = utils.compute_rates(train_config, Prand, train_channel_losses)
+sum_rate_rand = np.mean(np.sum(rates_rand, axis=2))
+print('RandP average sum rate:', sum_rate_rand)
 
 
 # for epoch in range(1, 3):  # 但实际情况中，应该没有epoch，每个数据都是实时的
@@ -387,6 +382,26 @@ print(f"train_rate: {loss_1}")
 
 loss_2 = test()
 print(f"test_rate: {loss_2}")
+
+#test for epa
+Pepa = np.ones((test_layouts, frame_num, test_K))
+rates_epa = utils.compute_rates(test_config, Pepa, test_channel_losses)
+sum_rate_epa = np.mean(np.sum(rates_epa, axis=2))
+print('EPA average sum rate (test):', sum_rate_epa)
+
+#test for random
+Prand = np.random.rand(test_layouts, frame_num, test_K)
+rates_rand = utils.compute_rates(test_config, Prand, test_channel_losses)
+sum_rate_rand = np.mean(np.sum(rates_rand, axis=2))
+print('RandP average sum rate:', sum_rate_rand)
+
+#test for wmmse
+Pini = np.random.rand(test_layouts, frame_num, test_K, 1)
+Y1 = utils.batch_WMMSE(Pini, np.ones([test_layouts*frame_num, test_K]),np.sqrt(test_channel_losses),1,var)
+Y2 = Y1.reshape(test_layouts, frame_num, test_K)
+rates_wmmse = utils.compute_rates(test_config, Y2, test_channel_losses)
+sum_rate_wmmse = np.mean(np.sum(rates_wmmse, axis=2))
+print('WMMSE average sum rate:', sum_rate_wmmse)
 
 
 
