@@ -231,6 +231,16 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 averaged_grad_list.append(current_grads)
         return averaged_grad_list
 
+    def averaged_nodes_params(self):
+        # 检查输入是否为空
+        if not self.node_model_list:
+            raise ValueError("node_model_list is NULL")
+        avg_nodes_params = []
+        for param_idx in range(len(list(self.node_model_list[0].parameters()))):
+            stacked_params = torch.stack([list(node_model.parameters())[param_idx] for node_model in self.node_model_list])
+            avg_nodes_params.append(torch.mean(stacked_params, dim=0))
+        return avg_nodes_params
+
     def airAvg_neighbor_gradients(self, node_grad_list, edge_index):
         pass
     
@@ -239,11 +249,11 @@ class DistributedMPNN(torch.nn.Module):  # per round
         node_avg_grad_list = []
         for node_idx in range(node_num):
             node_avg_grad = []
-            node_param_list = []
+            node_grad_list = []
             for frame_grad in frame_grad_list:
-                node_param_list.append(frame_grad[node_idx])
-            for param_idx in range(len(node_param_list[0])):
-                stacked_grads = torch.stack([node_param[param_idx] for node_param in node_param_list])
+                node_grad_list.append(frame_grad[node_idx])
+            for grad_param_idx in range(len(node_grad_list[0])):
+                stacked_grads = torch.stack([node_grad[grad_param_idx] for node_grad in node_grad_list])
                 node_avg_grad.append(torch.mean(stacked_grads, dim=0))
             node_avg_grad_list.append(node_avg_grad)
         return node_avg_grad_list
@@ -254,6 +264,11 @@ class DistributedMPNN(torch.nn.Module):  # per round
             for param, avg_grad in zip(node_model.parameters(), averaged_grad_list[node_idx]):
                 if param.grad is not None:
                     param.grad.data = avg_grad.data  # 更新梯度
+
+    def update_params(self, averaged_params):
+        for model in self.node_model_list:
+            for i, param in enumerate(model.parameters()):
+                param.data = averaged_params[i]
 
     def forward(self, data_list):  # per layout
         layout_rate = 0
@@ -277,7 +292,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
                     node_model.zero_grad()
                 # 对每个节点的 local_rate 单独进行反向传播
                 for local_rate in local_rate_list:
-                    local_rate.backward(retain_graph=True)  # 注意每调用一次，梯度会累加 此处选用手动清零，也可用累加结果求平均
+                    local_rate.backward(retain_graph=True)  # 注意每调用一次，梯度会累加，此处选用手动清零，也可用累加结果求平均
                     node_grad_list = []
                     for node_model in self.node_model_list:
                         node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
@@ -324,11 +339,15 @@ def train():
         # node_avg_grad_list = model.airAvg_neighbor_gradients(node_grad_list, layout_data[0].edge_index, layout_data[0].y)  # over the air,相当于梯度加权
 
         # 放这里会不会是学习率衰减太快了
-        if iteration % scheduler_size == 0:
+        if iteration % lr_update_interval == 0:
             for scheduler in model.schedulers:
                 scheduler.step()
 
-        # Todo:模型参数平均
+        # Todo:模型参数平均，类似与联邦学习
+        # 文章中是全部节点的平均，这其实有点不够分布式
+        if iteration % param_avg_interval == 0:
+            avg_param = model.averaged_nodes_params()
+            model.update_params(avg_param)  # 已验证成功更新
 
         total_rate += layout_sum_rate
     train_rate = total_rate/train_layouts/frame_num
@@ -353,8 +372,8 @@ frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
 train_config = init_parameters()
 var = train_config.output_noise_power / train_config.tx_power # 噪声归一化
-param_size = 50  #  邻居节点平均模型参数的layout个数
-scheduler_size = 50  # 学习率更新相隔的layout个数
+param_avg_interval= 20  #  邻居节点平均模型参数的layout个数
+lr_update_interval = 20  # 学习率更新相隔的layout个数
 
 # Train data generation
 '''
