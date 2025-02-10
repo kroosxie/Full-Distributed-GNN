@@ -33,10 +33,7 @@ class init_parameters():
                                                                 self.shortest_directLink_length,
                                                                 self.longest_directLink_length)
 
-# 整图输入，整图输出
-# 使用一跳子图
 # 考虑实际训练的噪声？
-# 可能需要节点list
 class LocalConv(MessagePassing):  # per layer
     def __init__(self, local_model_list, **kwargs):
         super(LocalConv, self).__init__(**kwargs)
@@ -232,8 +229,25 @@ class DistributedMPNN(torch.nn.Module):  # per round
             else:
                 # 如果没有邻居节点，使用自身的梯度
                 averaged_grad_list.append(current_grads)
-
         return averaged_grad_list
+
+    def airAvg_neighbor_gradients(self, node_grad_list, edge_index):
+        pass
+    
+    def average_node_gradients(self, frame_grad_list):
+        node_num = len(frame_grad_list[0])
+        node_avg_grad_list = []
+        for node_idx in range(node_num):
+            node_avg_grad = []
+            node_param_list = []
+            for frame_grad in frame_grad_list:
+                node_param_list.append(frame_grad[node_idx])
+            for param_idx in range(len(node_param_list[0])):
+                stacked_grads = torch.stack([node_param[param_idx] for node_param in node_param_list])
+                node_avg_grad.append(torch.mean(stacked_grads, dim=0))
+            node_avg_grad_list.append(node_avg_grad)
+        return node_avg_grad_list
+
 
     def update_gradients(self, averaged_grad_list):
         for node_idx, node_model in enumerate(self.node_model_list):
@@ -241,10 +255,11 @@ class DistributedMPNN(torch.nn.Module):  # per round
                 if param.grad is not None:
                     param.grad.data = avg_grad.data  # 更新梯度
 
-    def forward(self, data_list):
+    def forward(self, data_list):  # per layout
         layout_rate = 0
-        # sum_loss = 0
-        for data in data_list:
+        frame_grad_list = []
+        for data in data_list:  # per frame
+            sum_local_loss = 0  # 本地loss之和，非真实速率
             # utils.graph_showing(data)
             x0, edge_attr, edge_index = data.x, data.edge_attr, data.edge_index
             x1 = self.localconv(x=x0, edge_index=edge_index, edge_attr=edge_attr)  # 第一个slot进行，对应Layer_1
@@ -252,13 +267,36 @@ class DistributedMPNN(torch.nn.Module):  # per round
             out = self.localconv(x=x2, edge_index=edge_index, edge_attr=edge_attr)
             # 该p_out可用于训练过程中真实调整发射功率，也可仅用于传值计算loss
             output = self.localh2o(out[:, 1:])
+            print('power:', output.t())
             local_rate_list = self.computeLocalRate(data, output)  # 由于子图计算，与真实存在偏差
+            # 假设一个frame中收发对个数保持不变
+            # if model.training:
+            if self.training:
+                # 在每输入一个frame的data前先清除模型梯度，防止梯度积累
+                for node_model in self.node_model_list:
+                    node_model.zero_grad()
+                # 对每个节点的 local_rate 单独进行反向传播
+                for local_rate in local_rate_list:
+                    local_rate.backward(retain_graph=True)  # 注意每调用一次，梯度会累加 此处选用手动清零，也可用累加结果求平均
+                    node_grad_list = []
+                    for node_model in self.node_model_list:
+                        node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+                frame_grad_list.append(node_grad_list)
             frame_rate = self.computeFrameRate(data.y, output)  # 真实速率
+            print('frame rate: ', frame_rate)
             layout_rate += frame_rate.item()
-            # localRate = torch.stack(local_rate_list)
-            # sum_rate = localRate.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
-            # sum_loss += sum_rate.item()
-        return layout_rate, local_rate_list
+            local_loss = torch.stack(local_rate_list)
+            sum_loss = local_loss.sum()  # 注：若部分连接，会忽略部分干扰，导致sum_rate偏大
+            sum_local_loss += sum_loss.item()
+            print('The sum of the local losses of the frame: ', sum_local_loss)
+        if self.training:
+            # 平均各layout中各节点自身frames的梯度，然后将模型参数在节点间统一
+            layout_avg_grad = self.average_node_gradients(frame_grad_list)
+            self.update_gradients(layout_avg_grad)  # 使用平均梯度更新模型参数
+            # 更新模型参数
+            for optimizer in self.optimizers:
+                optimizer.step()
+        return layout_rate
 
 # 针对梯度计算，可分为per_frame或per_layout
 # 两者类比于 SGD 和 mini-batch GD
@@ -266,29 +304,32 @@ class DistributedMPNN(torch.nn.Module):  # per round
 def train():
     model.train()
     total_rate = 0
-    for layout_data in train_loader:
+    iteration = 0
+    for layout_data in train_loader:  # per layout
+        iteration += 1
         layout_data = [frame_data.to(device) for frame_data in layout_data]
-        # 清除梯度缓存,若后期加入over-the-air，对比时可不用清除累加
-        for optimizer in model.optimizers:
-            optimizer.zero_grad()
-        layout_sum_rate, local_rate_list = model(layout_data)  # 获取真实和速率和每个节点的损失列表
-        # 对每个节点的 local_rate 单独进行反向传播
-        for local_rate in local_rate_list:
-            local_rate.backward(retain_graph=True)
+        # 清除梯度缓存
+        # for optimizer in model.optimizers:
+        #     optimizer.zero_grad()
+        layout_sum_rate = model(layout_data)  # 获取真实和速率和每个节点的损失列表
 
-        此处需要好好思考
-        node_grad_list = []
-        for node_model in model.node_model_list:
-            node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+
+
+
+        # 每一个layout的frame更新一次
         # 感觉这样更新梯度过于频繁，可能会失效
         # 计算邻居节点的平均梯度
-        node_avg_grad_list = model.average_neighbor_gradients(node_grad_list, layout_data[0].edge_index)
-        # 使用平均梯度更新模型参数
-        model.update_gradients(node_avg_grad_list)
+        # 只有每个layout第一帧的拓扑结构即layout_data[0].edge_index，不合理
+        # node_avg_grad_list = model.average_neighbor_gradients(node_grad_list, layout_data[0].edge_index)  # 为什么是layout_data[0]
+        # node_avg_grad_list = model.airAvg_neighbor_gradients(node_grad_list, layout_data[0].edge_index, layout_data[0].y)  # over the air,相当于梯度加权
 
-        # 更新模型参数
-        for optimizer in model.optimizers:
-            optimizer.step()
+        # 放这里会不会是学习率衰减太快了
+        if iteration % scheduler_size == 0:
+            for scheduler in model.schedulers:
+                scheduler.step()
+
+        # Todo:模型参数平均
+
         total_rate += layout_sum_rate
     train_rate = total_rate/train_layouts/frame_num
     return train_rate  # 真实rate，非用于反向传播的loss
@@ -299,7 +340,7 @@ def test():
     for layout_data in test_loader:
         layout_data = [frame_data.to(device) for frame_data in layout_data]
         with torch.no_grad():
-            layout_sum_rate, _ = model(layout_data)
+            layout_sum_rate = model(layout_data)
             total_rate += layout_sum_rate
     test_rate = total_rate / test_layouts / frame_num
     return test_rate  # 真实rate
@@ -312,6 +353,8 @@ frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
 train_config = init_parameters()
 var = train_config.output_noise_power / train_config.tx_power # 噪声归一化
+param_size = 50  #  邻居节点平均模型参数的layout个数
+scheduler_size = 50  # 学习率更新相隔的layout个数
 
 # Train data generation
 '''
