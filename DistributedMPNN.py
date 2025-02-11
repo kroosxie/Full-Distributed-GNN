@@ -323,13 +323,9 @@ def train():
     for layout_data in train_loader:  # per layout
         iteration += 1
         layout_data = [frame_data.to(device) for frame_data in layout_data]
-        # 清除梯度缓存
         # for optimizer in model.optimizers:
         #     optimizer.zero_grad()
         layout_sum_rate = model(layout_data)  # 获取真实和速率和每个节点的损失列表
-
-
-
 
         # 每一个layout的frame更新一次
         # 感觉这样更新梯度过于频繁，可能会失效
@@ -367,21 +363,23 @@ def test():
 
 train_K = 20
 train_layouts = 100  # 模拟拓扑结构变化
-test_layouts = 50
 frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
 train_config = init_parameters()
 var = train_config.output_noise_power / train_config.tx_power # 噪声归一化
-param_avg_interval= 20  #  邻居节点平均模型参数的layout个数
+param_avg_interval= 20  # 邻居节点平均模型参数的layout个数
 lr_update_interval = 20  # 学习率更新相隔的layout个数
+threshold_rate = 0.8  # 构建部分连接图拓扑时的边阈值权重，滤除干扰值小于加权平均值的干扰边，参考值：0.8 2 3
+
 
 # Train data generation
 '''
-# layouts彼此间地理拓扑结构不同
-# 一个layout中分为多个frames，frame间地理拓扑相同，快衰落不同，但有关联。
-# 若建立子图时使用距离阈值，可保证同一个layout下的图拓扑一致，但使用一阶子图计算时可能忽略某些较大干扰信道；
-# 若建立子图时使用信道loss阈值，计算节点损失函数时意义明确，但拓扑信息存在变动。
-# 目前使用的是channel loss阈值
+# Train data模拟根据实际环境进行实时训练，[layouts, frames, K, K]
+# Train data分为多个layout，各layout间模拟节点移动，地理位置不同
+# layout中分为多个frame，各frame间地理位置相同，快衰落不同，但有关联。
+# 建立图拓扑结构时，使用信道loss阈值。好处是计算节点损失函数时意义明确，但拓扑信息存在变动。
+# 也可考虑固定每个layout的图拓扑结构，可保证同一个layout下的图拓扑一致，且data-loader可以使用batch-size，但使用一阶子图计算时干扰不够准确；
+# 目前暂定使用的是channel loss阈值
 '''
 train_channel_losses = D2D.train_channel_loss_generator_1(train_config, train_layouts, frame_num) # 真实信道
 # train_losses_simplified = D2D.train_channel_loss_generator_2(train_layouts, train_frames, D2DNum_K) # 简易信道（仿真使用）
@@ -390,17 +388,19 @@ train_channel_losses = D2D.train_channel_loss_generator_1(train_config, train_la
 # Data standardization/normalization
 norm_train_loss = utils.normalize_train_data(train_channel_losses)
 # norm_train_loss = utils.normalize_data_pro(train_channel_losses, train_K)  # 对直连和干扰信道分别norm
+#
 
 # Graph data processing
 print('Graph data processing')
 # 构建部分连接图，即干扰链路小于阈值的边忽略不计
-train_data_list = Gbld.proc_data_distributed_pc(train_channel_losses, norm_train_loss, train_K, graph_embedding_size)
+train_data_list = Gbld.proc_data_distributed_pc(train_channel_losses, norm_train_loss, train_K, graph_embedding_size,
+                                                threshold_rate)
 # batchsize暂设为1，简化逻辑，适应动态图
 # batchsize=1有必要吗？需要进一步看看channel生成过程，确定layouts，frames之间的关系
 # 后续可以再尝试调整
 train_loader = DataLoader(train_data_list, batch_size=1, shuffle=False, num_workers=0)
-# 可尝试以一个layout的多个帧为一个batch，注意不打乱顺序
-# train_loader = DataLoader(train_data_list, batch_size=frame_num, shuffle=False, num_workers=0)
+# Todo：可尝试以多个layout为一个batch，注意不打乱顺序
+# 没必要
 
 # Local training
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -410,10 +410,11 @@ model = DistributedMPNN(train_K).to(device)  # 基础本地模型
 # Test data generation
 test_config = init_parameters()
 test_K = train_K
+test_layouts = 50
 test_channel_losses = D2D.train_channel_loss_generator_1(test_config, test_layouts, frame_num) # 真实信道
 norm_test_loss = utils.normalize_train_data(test_channel_losses)
 # norm_test_loss = utils.normalize_data_pro(test_channel_losses, test_K)
-test_data_list = Gbld.proc_data_distributed_pc(test_channel_losses, norm_test_loss, test_K, graph_embedding_size)
+test_data_list = Gbld.proc_data_distributed_pc(test_channel_losses, norm_test_loss, test_K, graph_embedding_size, threshold_rate)
 test_loader = DataLoader(test_data_list, batch_size=1, shuffle=False, num_workers=0)
 
 

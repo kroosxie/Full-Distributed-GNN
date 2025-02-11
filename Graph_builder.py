@@ -28,7 +28,7 @@ def fully_connected_graph_builder(loss, std_H, K, graph_embedding_size):
     data = Data(x=x, edge_index=edge_index.contiguous(), edge_attr=edge_attr, y=y)
     return data
 
-def partially_connected_graph_builder(loss, std_H, K, graph_embedding_size):
+def partially_connected_graph_builder(loss, std_H, K, graph_embedding_size, threshold_rate):
     x1 = np.expand_dims(np.diag(std_H), axis=1)
     x2 = np.zeros((K, graph_embedding_size))
     x = np.concatenate((x1, x2), axis=1)
@@ -47,9 +47,6 @@ def partially_connected_graph_builder(loss, std_H, K, graph_embedding_size):
 
     # 滤除小于阈值的边
     # 如果出现某节点的所有的临边都被滤除的情况怎么办？
-    threshold_rate = 2
-    # threshold_rate = 0.8
-    # threshold_rate = 3
     threshold = edge_attr_avg * threshold_rate
     mask_filter = edge_attr.squeeze() > threshold
     filtered_edge_attr = edge_attr[mask_filter]
@@ -89,14 +86,14 @@ def proc_data_distributed_fc(HH_real, H_std, K, init_emb_size):
     return data_list
 
 # partially connection
-def proc_data_distributed_pc(HH_real, H_std, K, init_emb_size):
+def proc_data_distributed_pc(HH_real, H_std, K, init_emb_size, threshold):
     n = HH_real.shape[0]  # 即 layouts,每个layouts构建一张图
     m = HH_real.shape[1]  # 每个frame也是一张图
     frames_list = []
     layouts_list = []
     for i in range(n):
         for j in range(m):
-            data = partially_connected_graph_builder(HH_real[i,j,:,:], H_std[i,j,:,:], K, init_emb_size)
+            data = partially_connected_graph_builder(HH_real[i,j,:,:], H_std[i,j,:,:], K, init_emb_size, threshold)
             frames_list.append((data))
         layouts_list.append(frames_list)
         frames_list = []
