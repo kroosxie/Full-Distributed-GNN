@@ -59,6 +59,18 @@ def train():
         optimizer.step()
     return total_loss / train_layouts / frame_num
 
+def test():
+    model.eval()
+    total_loss = 0
+    for data in test_loader:
+        data = data.to(device)
+        with torch.no_grad():
+            out = model(data)
+            print('out_p', out.t())
+            loss = sr_loss(data, out, test_K)
+            total_loss += loss.item() * data.num_graphs
+    return total_loss / test_layouts / frame_num
+
 def MLP(channels, batch_norm=True):
     return Seq(*[
         Seq(Lin(channels[i - 1], channels[i]), ReLU())
@@ -150,7 +162,44 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9) 
 
 for epoch in range(1, 20):
     loss = train()
+    print(f'epoch: {epoch}  train_loss: {loss}')
     scheduler.step()  # 动态调整优化器学习率
+
+
+test_config = init_parameters()
+test_layouts = 50
+test_K = train_K
+test_channel_losses = D2D.train_channel_loss_generator_1(test_config, test_layouts, frame_num) # 真实信道
+test_channel_losses_merged = test_channel_losses.reshape(test_layouts*frame_num, test_K, test_K)
+norm_test_loss = utils.normalize_train_data(test_channel_losses_merged)
+# norm_test_loss = utils.normalize_data_pro(test_channel_losses, test_K)
+test_data_list = Gbld.proc_data_centralized(test_channel_losses_merged, norm_test_loss, test_K, graph_embedding_size)
+test_loader = DataLoader(test_data_list, batch_size=50, shuffle=False, num_workers=0)
+
+
+#test for MPNN
+sum_rate_mpnn = test()
+print('MPNN average sum rate:', -sum_rate_mpnn)
+
+#test for epa
+Pepa = np.ones((test_layouts, frame_num, test_K))
+rates_epa = utils.compute_rates(test_config, Pepa, test_channel_losses)
+sum_rate_epa = np.mean(np.sum(rates_epa, axis=2))
+print('EPA average sum rate (test):', sum_rate_epa)
+
+#test for random
+Prand = np.random.rand(test_layouts, frame_num, test_K)
+rates_rand = utils.compute_rates(test_config, Prand, test_channel_losses)
+sum_rate_rand = np.mean(np.sum(rates_rand, axis=2))
+print('RandP average sum rate:', sum_rate_rand)
+
+#test for wmmse
+Pini = np.random.rand(test_layouts, frame_num, test_K, 1)
+Y1 = utils.batch_WMMSE(Pini, np.ones([test_layouts*frame_num, test_K]),np.sqrt(test_channel_losses),1,var)
+Y2 = Y1.reshape(test_layouts, frame_num, test_K)
+rates_wmmse = utils.compute_rates(test_config, Y2, test_channel_losses)
+sum_rate_wmmse = np.mean(np.sum(rates_wmmse, axis=2))
+print('WMMSE average sum rate:', sum_rate_wmmse)
 
 
 print("end")
