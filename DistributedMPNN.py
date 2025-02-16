@@ -106,7 +106,6 @@ class LocalH2O(torch.nn.Module):  # 需要继承吗？
     def __init__(self, local_model_list, **kwargs):
         super(LocalH2O, self).__init__()
         self.local_model_list = local_model_list
-        # self.local_h2o_list = [model.h2o for model in local_model_list]
 
     def forward(self, data_out):
         node_num = len(self.local_model_list)
@@ -128,14 +127,12 @@ class DistributedMPNN(torch.nn.Module):  # per round
             self.node_model_list.append(node_model)
         self.localconv = LocalConv(self.node_model_list).to(device)
         self.localh2o = LocalH2O(self.node_model_list).to(device)
-        # 创建优化器列表，每个 node_model 一个优化器
         # self.optimizers = [torch.optim.SGD(node_model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4) for node_model in self.node_model_list]
-        self.optimizers = [torch.optim.Adam(node_model.parameters(), lr=0.002) for node_model in self.node_model_list]
+        self.optimizers = [torch.optim.Adam(node_model.parameters(), lr) for node_model in self.node_model_list]
         self.schedulers = [torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9) for optimizer in self.optimizers] # 学习率调整
 
     # 提取子图，暂定一阶
     def collect_subgraph(self, data, power):
-        # 初始化一个列表，用于存储每个节点的一阶子图
         subgraph_list = []
         for node_idx in range(data.num_nodes):
             # 抽取一阶子图，mapping是子图节点在原图中的索引, sub_node是子图节点在重新编号后的索引,
@@ -174,8 +171,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
             rx_power = torch.mul(power, abs_H_2)
             valid_rx_power = rx_power[subgraph.mapping]
             interference = rx_power.sum()-valid_rx_power + var
-            # interference的requires_grad设为False 在此处对吗？
-            interference = interference.detach()
+            interference = interference.detach()  # interference的requires_grad设为False 在此处对吗？
             rate = torch.log2(1 + torch.div(valid_rx_power, interference))
             subG_loss = torch.neg(rate)
             subG_rate_list.append(subG_loss)
@@ -258,7 +254,6 @@ class DistributedMPNN(torch.nn.Module):  # per round
             node_avg_grad_list.append(node_avg_grad)
         return node_avg_grad_list
 
-
     def update_gradients(self, averaged_grad_list):
         for node_idx, node_model in enumerate(self.node_model_list):
             for param, avg_grad in zip(node_model.parameters(), averaged_grad_list[node_idx]):
@@ -285,17 +280,20 @@ class DistributedMPNN(torch.nn.Module):  # per round
             print('power:', output.t())
             local_rate_list = self.computeLocalRate(data, output)  # 由于子图计算，与真实存在偏差
             # 假设一个frame中收发对个数保持不变
-            # if model.training:
             if self.training:
-                # 在每输入一个frame的data前先清除模型梯度，防止梯度积累
-                for node_model in self.node_model_list:
-                    node_model.zero_grad()
+                for optimizer in self.optimizers:
+                    optimizer.zero_grad()
+                node_grad_list = []
                 # 对每个节点的 local_rate 单独进行反向传播
-                for local_rate in local_rate_list:
+                for local_rate, node_model in zip(local_rate_list, self.node_model_list):
+                    # 在每输入一个frame的data前先清除模型梯度，防止梯度积累
+                    node_model.zero_grad()
+                    # 或者设置共享参数？
                     local_rate.backward(retain_graph=True)  # 注意每调用一次，梯度会累加，此处选用手动清零，也可用累加结果求平均
-                    node_grad_list = []
-                    for node_model in self.node_model_list:
-                        node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+                    node_grad_list.append([param.grad.clone() for param in node_model.parameters()])
+                    # node_grad_list_test = []
+                    # for node_model in self.node_model_list:
+                    #     node_grad_list_test.append([param.grad.clone() for param in node_model.parameters()])
                 frame_grad_list.append(node_grad_list)
             frame_rate = self.computeFrameRate(data.y, output)  # 真实速率
             print('frame rate: ', frame_rate)
@@ -311,6 +309,7 @@ class DistributedMPNN(torch.nn.Module):  # per round
             # 更新模型参数
             for optimizer in self.optimizers:
                 optimizer.step()
+            print('node param updated')
         return layout_rate
 
 # 针对梯度计算，可分为per_frame或per_layout
@@ -320,31 +319,26 @@ def train():
     model.train()
     total_rate = 0
     iteration = 0
+    # 初始参数平均
+    avg_param = model.averaged_nodes_params()
+    model.update_params(avg_param)
+    print('node param initially averaged')
     for layout_data in train_loader:  # per layout
         iteration += 1
+        print(f'------第{iteration}个layout------')
         layout_data = [frame_data.to(device) for frame_data in layout_data]
-        # for optimizer in model.optimizers:
-        #     optimizer.zero_grad()
         layout_sum_rate = model(layout_data)  # 获取真实和速率和每个节点的损失列表
-
-        # 每一个layout的frame更新一次
-        # 感觉这样更新梯度过于频繁，可能会失效
-        # 计算邻居节点的平均梯度
-        # 只有每个layout第一帧的拓扑结构即layout_data[0].edge_index，不合理
-        # node_avg_grad_list = model.average_neighbor_gradients(node_grad_list, layout_data[0].edge_index)  # 为什么是layout_data[0]
-        # node_avg_grad_list = model.airAvg_neighbor_gradients(node_grad_list, layout_data[0].edge_index, layout_data[0].y)  # over the air,相当于梯度加权
-
-        # 放这里会不会是学习率衰减太快了
+        # 学习率更新
         if iteration % lr_update_interval == 0:
             for scheduler in model.schedulers:
                 scheduler.step()
-
+            print('scheduler updated')
         # Todo:模型参数平均，类似与联邦学习
         # 文章中是全部节点的平均，这其实有点不够分布式
         if iteration % param_avg_interval == 0:
             avg_param = model.averaged_nodes_params()
             model.update_params(avg_param)  # 已验证成功更新
-
+            print('node param averaged')
         total_rate += layout_sum_rate
     train_rate = total_rate/train_layouts/frame_num
     return train_rate  # 真实rate，非用于反向传播的loss
@@ -362,13 +356,14 @@ def test():
 
 
 train_K = 20
-train_layouts = 100  # 模拟拓扑结构变化
+train_layouts = 40  # 模拟拓扑结构变化
 frame_num = 10  # 每个layout下的帧数
 graph_embedding_size = 8  # 节点初始为1+8=9维
 train_config = init_parameters()
 var = train_config.output_noise_power / train_config.tx_power # 噪声归一化
-param_avg_interval= 20  # 邻居节点平均模型参数的layout个数
-lr_update_interval = 20  # 学习率更新相隔的layout个数
+param_avg_interval = 1  # 邻居节点平均模型参数的layout个数
+lr = 0.01  # Adam优化器的原初始值为0.002
+lr_update_interval = 10  # 学习率更新相隔的layout个数
 threshold_rate = 0.8  # 构建部分连接图拓扑时的边阈值权重，滤除干扰值小于加权平均值的干扰边，参考值：0.8 2 3
 
 
@@ -388,7 +383,6 @@ train_channel_losses = D2D.train_channel_loss_generator_1(train_config, train_la
 # Data standardization/normalization
 norm_train_loss = utils.normalize_train_data(train_channel_losses)
 # norm_train_loss = utils.normalize_data_pro(train_channel_losses, train_K)  # 对直连和干扰信道分别norm
-#
 
 # Graph data processing
 print('Graph data processing')
@@ -397,10 +391,9 @@ train_data_list = Gbld.proc_data_distributed_pc(train_channel_losses, norm_train
                                                 threshold_rate)
 # batchsize暂设为1，简化逻辑，适应动态图
 # batchsize=1有必要吗？需要进一步看看channel生成过程，确定layouts，frames之间的关系
-# 后续可以再尝试调整
 train_loader = DataLoader(train_data_list, batch_size=1, shuffle=False, num_workers=0)
-# Todo：可尝试以多个layout为一个batch，注意不打乱顺序
-# 没必要
+# train_loader = DataLoader(train_data_list, batch_size=1, shuffle=True, num_workers=0)
+# Todo：可尝试以多个layout为一个batch，注意不打乱顺序。没必要
 
 # Local training
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -410,7 +403,7 @@ model = DistributedMPNN(train_K).to(device)  # 基础本地模型
 # Test data generation
 test_config = init_parameters()
 test_K = train_K
-test_layouts = 50
+test_layouts = 5
 test_channel_losses = D2D.train_channel_loss_generator_1(test_config, test_layouts, frame_num) # 真实信道
 norm_test_loss = utils.normalize_train_data(test_channel_losses)
 # norm_test_loss = utils.normalize_data_pro(test_channel_losses, test_K)
